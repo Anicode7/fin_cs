@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GSpice Circuit Simulator</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; padding: 0; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useRef, useEffect } = React;
+
+        const CircuitSimulator = () => {
+          const canvasRef = useRef(null);
+          const [components, setComponents] = useState([]);
+          const [wires, setWires] = useState([]);
+          const [selectedTool, setSelectedTool] = useState(null);
+          const [wireMode, setWireMode] = useState(false);
+          const [eraserMode, setEraserMode] = useState(false);
+          const [selectedTerminals, setSelectedTerminals] = useState([]);
+          const [componentCounter, setComponentCounter] = useState({ R: 1, C: 1, L: 1, V: 1, I: 1, G: 1 });
+          const [hoveredTerminal, setHoveredTerminal] = useState(null);
+          const [showInfo, setShowInfo] = useState(false);
+          const [backendStatus, setBackendStatus] = useState('checking');
+          const [simulationResults, setSimulationResults] = useState(null);
+          const [isSimulating, setIsSimulating] = useState(false);
+          const [showResults, setShowResults] = useState(false);
+          const [finalTime, setFinalTime] = useState(1.0);
+
+          const BACKEND_URL = 'http://localhost:5000';
+
+          // Simple icon components since lucide-react isn't available
+          const Icon = ({ type, className, style }) => {
+            const icons = {
+              zap: '⚡',
+              minus: '—',
+              trendingUp: '📈',
+              battery: '🔋',
+              anchor: '⚓',
+              gitBranch: '🔀',
+              play: '▶',
+              trash: '🗑',
+              download: '⬇',
+              info: 'ℹ',
+              wifi: '📶',
+              wifiOff: '📵',
+              eraser: '&' ,
+            };
+            return <span className={className} style={style}>{icons[type] || '•'}</span>;
+          };
+
+          const tools = [
+            { id: 'resistor', name: 'Resistor', icon: 'minus', color: '#fbbf24', prefix: 'R', prompt: 'Enter resistor value (e.g., 1E3 for 1kΩ):' },
+            { id: 'capacitor', name: 'Capacitor', icon: 'trendingUp', color: '#06b6d4', prefix: 'C', prompt: 'Enter capacitor value (e.g., 10E-9 for 10nF):' },
+            { id: 'inductor', name: 'Inductor', icon: 'gitBranch', color: '#fb923c', prefix: 'L', prompt: 'Enter inductor value (e.g., 1E-3 for 1mH):' },
+            { id: 'voltage', name: 'Voltage Source', icon: 'battery', color: '#22c55e', prefix: 'V', prompt: 'Enter voltage value (e.g., 5 for 5V):' },
+            { id: 'current', name: 'Current Source', icon: 'zap', color: '#ef4444', prefix: 'I', prompt: 'Enter current value (e.g., 5 for 5A):' },
+            { id: 'ground', name: 'Ground', icon: 'anchor', color: '#78716c', prefix: 'G', prompt: null }
+          ];
+
+          useEffect(() => {
+            checkBackendStatus();
+            const interval = setInterval(checkBackendStatus, 5000);
+            return () => clearInterval(interval);
+          }, []);
+
+          const checkBackendStatus = async () => {
+            try {
+              const response = await fetch(`${BACKEND_URL}/api/health`, { timeout: 2000 });
+              if (response.ok) {
+                setBackendStatus('online');
+              } else {
+                setBackendStatus('offline');
+              }
+            } catch (error) {
+              setBackendStatus('offline');
+            }
+          };
+
+          const DisjointSet = () => {
+            const parent = {};
+            const rank = {};
+
+            const add = (x) => {
+              if (!(x in parent)) {
+                parent[x] = x;
+                rank[x] = 0;
+              }
+            };
+
+            const find = (x) => {
+              if (parent[x] !== x) {
+                parent[x] = find(parent[x]);
+              }
+              return parent[x];
+            };
+
+            const union = (x, y) => {
+              const rootX = find(x);
+              const rootY = find(y);
+              if (rootX !== rootY) {
+                if (rank[rootX] > rank[rootY]) {
+                  parent[rootY] = rootX;
+                } else if (rank[rootX] < rank[rootY]) {
+                  parent[rootX] = rootY;
+                } else {
+                  parent[rootY] = rootX;
+                  rank[rootX] += 1;
+                }
+              }
+            };
+
+            return { add, find, union, parent };
+          };
+
+          const generateNetlist = () => {
+            const netlist = [];
+            const nodal = [];
+
+            components.forEach(comp => {
+              if (comp.prefix !== 'G') {
+                netlist.push([comp.id, comp.terminals.n1, comp.terminals.n2, comp.value || '']);
+              }
+            });
+
+            wires.forEach(wire => {
+              nodal.push([wire.from, wire.to]);
+            });
+
+            const dsu = DisjointSet();
+
+            nodal.forEach(pair => {
+              pair.forEach(element => dsu.add(element));
+            });
+
+            // --- Ensure Ground is added ---
+            dsu.add('Ground');
+            components.forEach(c => {
+              if(c.type === 'ground') dsu.add('Ground');
+            });
+            // -----------------------------
+
+            nodal.forEach(pair => {
+              dsu.union(pair[0], pair[1]);
+            });
+
+            const rootGround = dsu.find('Ground');
+            dsu.parent['Ground'] = 'Ground';
+            if (rootGround) {
+              dsu.parent[rootGround] = 'Ground';
+            }
+
+            const rootToNumber = {};
+            let currentNumber = 0;
+
+            Object.keys(dsu.parent).forEach(element => {
+              const root = dsu.find(element);
+              if (!(root in rootToNumber)) {
+                if (root === 'Ground') {
+                  rootToNumber[root] = 0;
+                } else {
+                  currentNumber += 1;
+                  rootToNumber[root] = currentNumber;
+                }
+              }
+            });
+
+            const renamedArray = netlist.map(row => {
+              const newRow = [...row];
+              newRow[1] = String(rootToNumber[dsu.find(row[1])] || 0);
+              newRow[2] = String(rootToNumber[dsu.find(row[2])] || 0);
+              return newRow;
+            });
+
+            return renamedArray;
+          };
+
+          const handleCanvasClick = (e) => {
+            if (!selectedTool || wireMode || eraserMode) return;
+
+            const rect = canvasRef.current.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            const tool = tools.find(t => t.id === selectedTool);
+            if (!tool) return;
+
+            let value = null;
+            if (tool.prompt) {
+              value = prompt(tool.prompt);
+              if (!value) return;
+            }
+
+            const componentId = `${tool.prefix}${componentCounter[tool.prefix]}`;
+            setComponentCounter(prev => ({ ...prev, [tool.prefix]: prev[tool.prefix] + 1 }));
+
+            const newComponent = {
+              id: componentId,
+              type: tool.id,
+              x,
+              y,
+              value,
+              color: tool.color,
+              prefix: tool.prefix,
+              terminals: tool.id === 'ground'
+                ? { Ground: 'Ground' }
+                : { n1: `${componentId}.n1`, n2: `${componentId}.n2` }
+            };
+
+            setComponents(prev => [...prev, newComponent]);
+            setSelectedTool(null);
+          };
+
+          const handleTerminalClick = (terminal) => {
+            if (!wireMode || eraserMode) return;
+
+            setSelectedTerminals(prev => {
+              const newSelection = [...prev, terminal];
+
+              if (newSelection.length === 2) {
+                setWires(prevWires => [...prevWires, { from: newSelection[0], to: newSelection[1] }]);
+                return [];
+              }
+
+              return newSelection;
+            });
+          };
+
+
+          const handleEraseClick = (e) => {
+            if (!eraserMode) return;
+
+            const rect = canvasRef.current.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // --- Check for component click ---
+            let componentToDelete = null;
+            // Iterate backwards so we hit the top-most component first
+            for (const comp of [...components].reverse()) {
+              let hit = false;
+              if (comp.type === 'ground') {
+                // Check ground component (circle, radius 12)
+                const dist = Math.sqrt((x - comp.x) ** 2 + (y - comp.y) ** 2);
+                if (dist < 12) {
+                  hit = true;
+                }
+              } else {
+                // Check other components (rects, 60x20)
+                if (x >= comp.x && x <= comp.x + 60 && y >= comp.y && y <= comp.y + 20) {
+                  hit = true;
+                }
+              }
+
+              if (hit) {
+                componentToDelete = comp;
+                break;
+              }
+            }
+
+            if (componentToDelete) {
+              // Get all terminals for the deleted component
+              const terminals = Object.values(componentToDelete.terminals);
+
+              // Remove the component
+              setComponents(prev => prev.filter(c => c.id !== componentToDelete.id));
+
+              // Remove all wires connected to those terminals
+              setWires(prevWires => prevWires.filter(wire =>
+                !terminals.includes(wire.from) && !terminals.includes(wire.to)
+              ));
+
+              return; // Found and deleted a component, so we're done
+            }
+
+            // --- Check for wire click ---
+            let wireToDelete = null;
+            for (const wire of [...wires].reverse()) {
+                const fromComp = components.find(c => Object.values(c.terminals).includes(wire.from));
+                const toComp = components.find(c => Object.values(c.terminals).includes(wire.to));
+
+                if (!fromComp || !toComp) continue;
+
+                // Get coords for wire start (x1, y1)
+                let x1, y1;
+                if (fromComp.type === 'ground') {
+                  x1 = fromComp.x; y1 = fromComp.y;
+                } else {
+                  const isN1 = fromComp.terminals.n1 === wire.from;
+                  x1 = isN1 ? fromComp.x : fromComp.x + 60;
+                  y1 = fromComp.y + 10;
+                }
+
+                // Get coords for wire end (x2, y2)
+                let x2, y2;
+                if (toComp.type === 'ground') {
+                  x2 = toComp.x; y2 = toComp.y;
+                } else {
+                  const isN1 = toComp.terminals.n1 === wire.to;
+                  x2 = isN1 ? toComp.x : toComp.x + 60;
+                  y2 = toComp.y + 10;
+                }
+
+                // --- Point-to-Line Segment Distance Check ---
+                const L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2;
+                if (L2 === 0) continue; // Skip zero-length wires
+
+                // Project click point (x, y) onto the line
+                const t = ((x - x1) * (x2 - x1) + (y - y1) * (y2 - y1)) / L2;
+                const t_clamped = Math.max(0, Math.min(1, t));
+
+                // Find closest point on the line segment
+                const closestX = x1 + t_clamped * (x2 - x1);
+                const closestY = y1 + t_clamped * (y2 - y1);
+
+                // Calculate distance from click to closest point
+                const dist = Math.sqrt((x - closestX) ** 2 + (y - closestY) ** 2);
+
+                // Set a click tolerance (e.g., 5 pixels)
+                if (dist < 5) {
+                  wireToDelete = wire;
+                  break;
+                }
+            }
+
+            if (wireToDelete) {
+              // Remove just the wire
+              // Add a unique ID to wires if they don't have one, or filter by object ref
+              setWires(prevWires => prevWires.filter(w => w !== wireToDelete));
+              return;
+            }
+          };
+
+          const handleSimulate = async () => {
+            if (backendStatus !== 'online') {
+              alert('Backend server is offline! Please start the Flask backend first.\\n\\nRun: python app.py');
+              return;
+            }
+
+            if (components.length === 0) {
+              alert('Please add components to the circuit first!');
+              return;
+            }
+
+            const netlist = generateNetlist();
+
+            const hasGround = components.some(c => c.type === 'ground');
+            if (!hasGround) {
+              alert('Please add a Ground node to the circuit!');
+              return;
+            }
+
+            setIsSimulating(true);
+            setSimulationResults(null);
+
+            try {
+              const response = await fetch(`${BACKEND_URL}/api/simulate`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  netlist: netlist,
+                  tf: finalTime
+                })
+              });
+
+              const data = await response.json();
+
+              if (response.ok && data.success) {
+                setSimulationResults(data);
+                setShowResults(true);
+                alert('Simulation completed successfully!');
+              } else {
+                alert(`Simulation failed:\\n${data.error}\\n\\nMATLAB Output:\\n${data.matlab_output || ''}`);
+              }
+            } catch (error) {
+              alert(`Error connecting to backend:\\n${error.message}\\n\\nMake sure Flask server is running!`);
+            } finally {
+              setIsSimulating(false);
+            }
+          };
+
+          const downloadNetlist = () => {
+            const netlist = generateNetlist();
+            let output = '';
+
+            netlist.forEach(entry => {
+              output += entry.join(' ') + '\\n';
+            });
+
+            const blob = new Blob([output], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'circuit_netlist.txt';
+            a.click();
+            URL.revokeObjectURL(url);
+          };
+
+          const clearCircuit = () => {
+            if (confirm('Are you sure you want to clear the circuit?')) {
+              setComponents([]);
+              setWires([]);
+              setSelectedTerminals([]);
+              setComponentCounter({ R: 1, C: 1, L: 1, V: 1, I: 1, G: 1 });
+              setSimulationResults(null);
+              setShowResults(false);
+            }
+          };
+
+          useEffect(() => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+
+            ctx.fillStyle = '#fafafa';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.strokeStyle = '#e5e7eb';
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i < canvas.width; i += 20) {
+              ctx.beginPath();
+              ctx.moveTo(i, 0);
+              ctx.lineTo(i, canvas.height);
+              ctx.stroke();
+            }
+            for (let i = 0; i < canvas.height; i += 20) {
+              ctx.beginPath();
+              ctx.moveTo(0, i);
+              ctx.lineTo(canvas.width, i);
+              ctx.stroke();
+            }
+
+            wires.forEach(wire => {
+              const fromComp = components.find(c => Object.values(c.terminals).includes(wire.from));
+              const toComp = components.find(c => Object.values(c.terminals).includes(wire.to));
+
+              if (!fromComp || !toComp) return;
+
+              let fromX, fromY, toX, toY;
+
+              if (fromComp.type === 'ground') {
+                fromX = fromComp.x;
+                fromY = fromComp.y;
+              } else {
+                const isN1 = fromComp.terminals.n1 === wire.from;
+                fromX = isN1 ? fromComp.x : fromComp.x + 60;
+                fromY = fromComp.y + 10;
+              }
+
+              if (toComp.type === 'ground') {
+                toX = toComp.x;
+                toY = toComp.y;
+              } else {
+                const isN1 = toComp.terminals.n1 === wire.to;
+                toX = isN1 ? toComp.x : toComp.x + 60;
+                toY = toComp.y + 10;
+              }
+
+              ctx.strokeStyle = '#374151';
+              ctx.lineWidth = 3;
+              ctx.beginPath();
+              ctx.moveTo(fromX, fromY);
+              ctx.lineTo(toX, toY);
+              ctx.stroke();
+            });
+
+            components.forEach(comp => {
+              if (comp.type === 'ground') {
+                ctx.fillStyle = comp.color;
+                ctx.beginPath();
+                ctx.arc(comp.x, comp.y, 12, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.strokeStyle = '#1f2937';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(comp.x, comp.y);
+                ctx.lineTo(comp.x, comp.y + 15);
+                ctx.stroke();
+
+                for (let i = 0; i < 3; i++) {
+                  const width = 16 - i * 5;
+                  ctx.beginPath();
+                  ctx.moveTo(comp.x - width / 2, comp.y + 15 + i * 4);
+                  ctx.lineTo(comp.x + width / 2, comp.y + 15 + i * 4);
+                  ctx.stroke();
+                }
+
+                ctx.fillStyle = '#1f2937';
+                ctx.font = 'bold 11px Inter, system-ui, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(comp.id, comp.x, comp.y + 35);
+
+                ctx.fillStyle = '#1f2937';
+                ctx.beginPath();
+                ctx.arc(comp.x, comp.y, 4, 0, Math.PI * 2);
+                ctx.fill();
+              } else {
+                ctx.fillStyle = comp.color;
+                ctx.fillRect(comp.x, comp.y, 60, 20);
+                ctx.strokeStyle = '#1f2937';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(comp.x, comp.y, 60, 20);
+
+                ctx.fillStyle = '#1f2937';
+                ctx.font = 'bold 11px Inter, system-ui, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(comp.id, comp.x + 30, comp.y + 14);
+
+                const terminals = [
+                  { x: comp.x, y: comp.y + 10, name: comp.terminals.n1 },
+                  { x: comp.x + 60, y: comp.y + 10, name: comp.terminals.n2 }
+                ];
+
+                terminals.forEach(term => {
+                  const isHovered = hoveredTerminal === term.name;
+                  const isSelected = selectedTerminals.includes(term.name);
+
+                  ctx.fillStyle = isSelected ? '#3b82f6' : isHovered ? '#10b981' : '#1f2937';
+                  ctx.beginPath();
+                  ctx.arc(term.x, term.y, isHovered || isSelected ? 5 : 4, 0, Math.PI * 2);
+                  ctx.fill();
+                });
+              }
+            });
+          }, [components, wires, hoveredTerminal, selectedTerminals, eraserMode]); // Add eraserMode to dependency array
+
+          const handleMouseMove = (e) => {
+            if (!wireMode) {
+              setHoveredTerminal(null);
+              return;
+            }
+
+            const rect = canvasRef.current.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            let foundTerminal = null;
+
+            for (const comp of components) {
+              if (comp.type === 'ground') {
+                const dist = Math.sqrt((x - comp.x) ** 2 + (y - comp.y) ** 2);
+                if (dist < 8) {
+                  foundTerminal = 'Ground';
+                  break;
+                }
+              } else {
+                const terminals = [
+                  { x: comp.x, y: comp.y + 10, name: comp.terminals.n1 },
+                  { x: comp.x + 60, y: comp.y + 10, name: comp.terminals.n2 }
+                ];
+
+                for (const term of terminals) {
+                  const dist = Math.sqrt((x - term.x) ** 2 + (y - term.y) ** 2);
+                  if (dist < 8) {
+                    foundTerminal = term.name;
+                    break;
+                  }
+                }
+                if (foundTerminal) break;
+              }
+            }
+
+            setHoveredTerminal(foundTerminal);
+          };
+
+          const handleCanvasTerminalClick = (e) => {
+            if (!wireMode || !hoveredTerminal || eraserMode) return;
+            handleTerminalClick(hoveredTerminal);
+          };
+
+          return (
+            <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white" style={{ fontFamily: 'system-ui, sans-serif' }}>
+              <div className="bg-slate-800/50 backdrop-blur-sm border-b border-slate-700 px-6 py-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
+                      <Icon type="zap" style={{ fontSize: '24px' }} />
+                    </div>
+                    <div>
+                      <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
+                        GSpice Circuit Simulator
+                      </h1>
+                      <p className="text-sm text-slate-400">v3.0 - Offline Edition</p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${
+                      backendStatus === 'online' ? 'bg-green-500/20 text-green-400' :
+                      backendStatus === 'offline' ? 'bg-red-500/20 text-red-400' :
+                      'bg-yellow-500/20 text-yellow-400'
+                    }`}>
+                      <Icon type={backendStatus === 'online' ? 'wifi' : 'wifiOff'} />
+                      <span className="text-sm font-medium">
+                        {backendStatus === 'online' ? 'Backend Online' :
+                         backendStatus === 'offline' ? 'Backend Offline' : 'Checking...'}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => setShowInfo(!showInfo)}
+                      className="p-2 hover:bg-slate-700 rounded-lg transition-colors"
+                    >
+                      <Icon type="info" style={{ fontSize: '20px' }} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {showInfo && (
+                <div className="bg-blue-500/10 border-l-4 border-blue-500 px-6 py-3 text-sm">
+                  <p className="text-slate-300">
+                    <strong>How to use:</strong> Select component → Click canvas → Toggle Wire mode →
+                    Click terminals → Set time → Simulate
+                  </p>
+                  <p className="text-slate-300 mt-2">
+                    <strong>Backend Required:</strong> Run <code className="bg-slate-700 px-2 py-1 rounded">python app.py</code> to start MATLAB backend
+                  </p>
+                </div>
+              )}
+
+              <div className="flex" style={{ height: 'calc(100vh - 120px)' }}>
+                <div className="w-64 bg-slate-800/30 backdrop-blur-sm border-r border-slate-700 p-4 space-y-4 overflow-y-auto">
+                  <div>
+                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Components</h3>
+                    <div className="space-y-2">
+                      {tools.map(tool => {
+                        const isSelected = selectedTool === tool.id;
+                        return (
+                          <button
+                            key={tool.id}
+                            onClick={() => {
+                              setSelectedTool(tool.id);
+                              setWireMode(false);
+                              setEraserMode(false);
+                            }}
+                            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${
+                              isSelected
+                                ? 'bg-gradient-to-r from-blue-500 to-purple-600 shadow-lg shadow-blue-500/20 scale-105'
+                                : 'bg-slate-700/50 hover:bg-slate-700'
+                            }`}
+                          >
+                            <div className={`p-2 rounded-lg ${isSelected ? 'bg-white/20' : 'bg-slate-600/50'}`}>
+                              <Icon type={tool.icon} style={{ color: isSelected ? 'white' : tool.color, fontSize: '20px' }} />
+                            </div>
+                            <span className="font-medium">{tool.name}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="pt-4 border-t border-slate-700">
+                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Tools</h3>
+                    <button
+                      onClick={() => {
+                        setWireMode(!wireMode);
+                        setSelectedTool(null);
+                        setSelectedTerminals([]);
+                        setEraserMode(false);
+                      }}
+                      className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${
+                        wireMode
+                          ? 'bg-gradient-to-r from-green-500 to-emerald-600 shadow-lg shadow-green-500/20'
+                          : 'bg-slate-700/50 hover:bg-slate-700'
+                      }`}
+                    >
+                      <div className={`p-2 rounded-lg ${wireMode ? 'bg-white/20' : 'bg-slate-600/50'}`}>
+                        <Icon type="gitBranch" style={{ fontSize: '20px' }} />
+                      </div>
+                      <div className="text-left flex-1">
+                        <div className="font-medium">Wire Mode</div>
+                        {wireMode && selectedTerminals.length === 1 && (
+                          <div className="text-xs text-white/80">Select 2nd terminal</div>
+                        )}
+                      </div>
+                    </button>
+
+
+                    <button
+                      onClick={() => {
+                        setEraserMode(!eraserMode);
+                        setWireMode(false);
+                        setSelectedTool(null);
+                      }}
+                      className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all mt-2 ${
+                        eraserMode
+                          ? 'bg-gradient-to-r from-red-500 to-rose-600 shadow-lg shadow-red-500/20'
+                          : 'bg-slate-700/50 hover:bg-slate-700'
+                      }`}
+                    >
+                      <div className={`p-2 rounded-lg ${eraserMode ? 'bg-white/20' : 'bg-slate-600/50'}`}>
+                        <Icon type="eraser" style={{ fontSize: '20px' }} />
+                      </div>
+                      <div className="text-left flex-1">
+                        <div className="font-medium">Eraser Mode</div>
+                      </div>
+                    </button>
+
+                  </div>
+
+                  <div className="pt-4 border-t border-slate-700">
+                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Simulation</h3>
+                    <div className="mb-3">
+                      <label className="text-sm text-slate-300 mb-1 block">Final Time (seconds)</label>
+                      <input
+                        type="number"
+                        value={finalTime}
+                        onChange={(e) => setFinalTime(parseFloat(e.target.value) || 1.0)}
+                        step="0.1"
+                        min="0.1"
+                        className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <button
+                      onClick={handleSimulate}
+                      disabled={components.length === 0 || isSimulating || backendStatus !== 'online'}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 rounded-lg transition-all shadow-lg shadow-green-500/20 disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none"
+                    >
+                      <Icon type="play" />
+                      <span className="font-semibold">{isSimulating ? 'Simulating...' : 'Simulate'}</span>
+                    </button>
+
+                    <button
+                      onClick={downloadNetlist}
+                      disabled={components.length === 0}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Icon type="download" />
+                      <span className="font-semibold">Download Netlist</span>
+                    </button>
+
+                    <button
+                      onClick={clearCircuit}
+                      disabled={components.length === 0}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-slate-700/50 hover:bg-red-500/20 hover:border-red-500 border border-slate-600 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Icon type="trash" />
+                      <span className="font-semibold">Clear All</span>
+                    </button>
+                  </div>
+
+                  <div className="pt-4 border-t border-slate-700">
+                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Statistics</h3>
+                    <div className="space-y-1 text-sm">
+                      <div className="flex justify-between text-slate-300">
+                        <span>Components:</span>
+                        <span className="font-semibold">{components.length}</span>
+                      </div>
+                      <div className="flex justify-between text-slate-300">
+                        <span>Connections:</span>
+                        <span className="font-semibold">{wires.length}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex-1 p-6 flex gap-6">
+                  <div className={showResults ? 'w-2/3 h-full' : 'w-full h-full'}>
+                    <div className="h-full bg-white rounded-xl shadow-2xl overflow-hidden relative">
+                      <canvas
+                        ref={canvasRef}
+                        onClick={(e) => {
+                          if (eraserMode) {
+                            handleEraseClick(e);
+                          } else {
+                            handleCanvasClick(e);
+                            handleCanvasTerminalClick(e);
+                          }
+                        }}
+                        onMouseMove={handleMouseMove}
+
+                        className={`w-full h-full ${eraserMode ? 'cursor-not-allowed' : wireMode ? 'cursor-crosshair' : 'cursor-default'}`}
+                      />
+
+                      <div className="absolute bottom-0 left-0 right-0 bg-slate-800/90 backdrop-blur-sm text-white px-4 py-2 flex items-center justify-between text-sm">
+                        <div className="flex items-center gap-4">
+                          <span className="text-slate-400">Mode:</span>
+                          <span className="font-semibold">
+
+                            {eraserMode ? '⌫ Eraser' : wireMode ? '🔗 Wiring' : selectedTool ? `✏️ Placing ${tools.find(t => t.id === selectedTool)?.name}` : '👆 Select Tool'}
+                          </span>
+                        </div>
+                        {wireMode && selectedTerminals.length > 0 && (
+                          <span className="text-green-400">📍 {selectedTerminals.length}/2 terminals selected</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {showResults && simulationResults && (
+                    <div className="w-1/3 bg-slate-800/50 backdrop-blur-sm rounded-xl p-4 overflow-y-auto">
+                      <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-lg font-bold">Simulation Results</h3>
+                        <button
+                          onClick={() => setShowResults(false)}
+                          className="text-slate-400 hover:text-white"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      <pre className="text-xs text-slate-300 whitespace-pre-wrap bg-slate-900/50 p-4 rounded-lg">
+                        {simulationResults.results}
+                      </pre>
+
+                      {simulationResults.figures && simulationResults.figures.length > 0 && (
+                        <div className="mt-4 space-y-3">
+                          <h4 className="text-sm font-semibold mb-2">Generated Figures:</h4>
+                          {simulationResults.figures.map((fig, idx) => (
+                            <div key={idx} className="rounded-lg overflow-hidden border border-slate-700 bg-white p-1">
+                              <img
+                                src={`${BACKEND_URL}/api/figures/${fig}?t=${new Date().getTime()}`}
+                                alt={`Simulation plot ${idx + 1}`}
+                                className="w-full h-auto"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        ReactDOM.render(<CircuitSimulator />, document.getElementById('root'));
+    </script>
+</body>
+</html>
